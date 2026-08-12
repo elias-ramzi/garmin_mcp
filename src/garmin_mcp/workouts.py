@@ -54,6 +54,16 @@ KNOWN_TARGET_TYPE_KEYS = {
     for key in keys
 }
 
+# Verified against DTOs Garmin returns for workouts created by this server.
+STEP_TYPE_IDS = {
+    "warmup": 1,
+    "cooldown": 2,
+    "interval": 3,
+    "recovery": 4,
+    "rest": 5,
+    "repeat": 6,
+}
+
 def configure(client):
     """Configure the module with the Garmin client instance"""
     global garmin_client
@@ -331,6 +341,281 @@ def _validate_target_type_steps(workout_data: dict) -> None:
         for step_index, step in enumerate(segment.get('workoutSteps', [])):
             path = f"workoutSegments[{segment_index}].workoutSteps[{step_index}]"
             _validate_target_type_step(step, path)
+
+
+# =============================================================================
+# IN-PLACE EDITING
+#
+# Garmin updates a workout with PUT /workout-service/workout/{workoutId},
+# carrying the complete workout DTO. Partial bodies are rejected with
+# "There is an error with the workout segments", so every edit is a
+# read-modify-write of the DTO Garmin itself returns.
+#
+# Editing in place keeps the workout id, so calendar entries that already
+# point at the workout survive and follow the new content. Delete-and-
+# re-upload does not: it mints a new id and orphans the schedule.
+# =============================================================================
+
+# Fields Garmin derives from the steps. Garmin does not validate them against
+# the steps it is sent: a PUT carrying estimatedDurationInSecs 99999 for a
+# 2700-second workout stores 99999. Dropping them makes Garmin recompute from
+# the steps, which is the only way an edited workout cannot end up advertising
+# a duration it does not have.
+_ESTIMATE_FIELDS = (
+    'estimatedDurationInSecs',
+    'estimatedDistanceInMeters',
+    'estimatedDuration',
+    'estimatedDistance',
+    'avgTrainingSpeed',
+)
+
+_STEP_CHANGE_KEYS = frozenset({
+    'order', 'step', 'description', 'type', 'end_condition',
+    'end_condition_value', 'target_type', 'target_zone',
+    'target_value_low', 'target_value_high', 'repeat_count',
+})
+
+
+def _index_steps_by_order(workout_data: dict) -> Dict[int, dict]:
+    """Map every step in the workout to its stepOrder.
+
+    Garmin numbers stepOrder globally across the whole workout rather than
+    per list: a repeat group at order 2 is followed by its own children at
+    orders 3 and 4, and the next top-level step continues at 5. That makes
+    stepOrder a unique address for any step, nested ones included, and it is
+    the same "order" value get_workout_by_id reports.
+    """
+    index: Dict[int, dict] = {}
+    for step, _ in _iter_workout_steps(workout_data):
+        order = step.get('stepOrder')
+        if order is None:
+            continue
+        order = int(order)
+        if order in index:
+            raise ValueError(
+                f"Workout has duplicate stepOrder {order}; cannot address "
+                f"steps by order. Use replace_workout instead."
+            )
+        index[order] = step
+    return index
+
+
+def _set_target_type(step: dict, target_key: str, path: str) -> None:
+    """Set a step's target type, resolving the id Garmin treats as canonical."""
+    target_id = KNOWN_TARGET_TYPE_KEYS.get(target_key)
+    if target_id is None:
+        known = ", ".join(sorted(KNOWN_TARGET_TYPE_KEYS))
+        raise ValueError(
+            f"{path}: unknown target_type {target_key!r}. Known types: {known}. "
+            f"Use replace_workout to set a target type outside this list."
+        )
+    step['targetType'] = {
+        "workoutTargetTypeId": target_id,
+        "workoutTargetTypeKey": target_key,
+    }
+    if target_key == 'no.target':
+        step['zoneNumber'] = None
+        step['targetValueOne'] = None
+        step['targetValueTwo'] = None
+
+
+def _apply_step_change(step: dict, change: dict, path: str) -> None:
+    """Apply one curated change to a single workout step, in place."""
+    unknown = set(change) - _STEP_CHANGE_KEYS
+    if unknown:
+        raise ValueError(
+            f"{path}: unknown field(s) {', '.join(sorted(unknown))}. "
+            f"Supported: {', '.join(sorted(_STEP_CHANGE_KEYS - {'order', 'step'}))}"
+        )
+
+    if 'description' in change:
+        step['description'] = change['description']
+
+    if 'type' in change:
+        step_key = change['type']
+        step_id = STEP_TYPE_IDS.get(step_key)
+        if step_id is None:
+            known = ", ".join(sorted(STEP_TYPE_IDS))
+            raise ValueError(f"{path}: unknown type {step_key!r}. Known: {known}")
+        step['stepType'] = {"stepTypeId": step_id, "stepTypeKey": step_key}
+
+    if 'end_condition' in change:
+        condition_key = change['end_condition']
+        condition_id = END_CONDITION_TYPE_IDS.get(condition_key)
+        if condition_id is None:
+            known = ", ".join(sorted(END_CONDITION_TYPE_IDS))
+            raise ValueError(
+                f"{path}: unknown end_condition {condition_key!r}. Known: {known}"
+            )
+        step['endCondition'] = {
+            "conditionTypeId": condition_id,
+            "conditionTypeKey": condition_key,
+        }
+
+    if 'end_condition_value' in change:
+        step['endConditionValue'] = float(change['end_condition_value'])
+
+    if 'repeat_count' in change:
+        if step.get('type') != 'RepeatGroupDTO':
+            raise ValueError(
+                f"{path}: repeat_count applies to a repeat group, but this "
+                f"step is {step.get('type')!r}"
+            )
+        repeats = int(change['repeat_count'])
+        if repeats < 1:
+            raise ValueError(f"{path}: repeat_count must be at least 1, got {repeats}")
+        # Garmin stores the count twice and honours whichever it reads first;
+        # leaving them out of sync makes the watch and the web UI disagree.
+        step['numberOfIterations'] = repeats
+        step['endConditionValue'] = float(repeats)
+
+    if 'target_type' in change:
+        _set_target_type(step, change['target_type'], path)
+
+    has_zone = 'target_zone' in change
+    has_range = 'target_value_low' in change or 'target_value_high' in change
+    if has_zone and has_range:
+        raise ValueError(
+            f"{path}: set either target_zone or target_value_low/high, not both. "
+            f"Garmin silently discards the custom range when a zone is present."
+        )
+
+    if has_zone:
+        zone = change['target_zone']
+        step['zoneNumber'] = None if zone is None else int(zone)
+        # A named zone and a custom range are mutually exclusive; clear the
+        # range so a leftover value cannot win.
+        step['targetValueOne'] = None
+        step['targetValueTwo'] = None
+
+    if has_range:
+        low = change.get('target_value_low')
+        high = change.get('target_value_high')
+        if low is None or high is None:
+            raise ValueError(
+                f"{path}: target_value_low and target_value_high must be given together"
+            )
+        if float(low) >= float(high):
+            raise ValueError(
+                f"{path}: target_value_low ({low}) must be less than "
+                f"target_value_high ({high})"
+            )
+        step['targetValueOne'] = float(low)
+        step['targetValueTwo'] = float(high)
+        step['zoneNumber'] = None
+
+
+def _apply_workout_changes(workout_data: dict, changes: dict) -> List[str]:
+    """Apply a curated change spec to a full workout DTO, in place.
+
+    Returns a human-readable list of what changed, so the tool can report the
+    edit without the caller diffing two DTOs.
+    """
+    known_top = {'name', 'description', 'steps'}
+    unknown = set(changes) - known_top
+    if unknown:
+        raise ValueError(
+            f"Unknown change field(s): {', '.join(sorted(unknown))}. "
+            f"Supported: {', '.join(sorted(known_top))}"
+        )
+    if not changes:
+        raise ValueError("changes is empty; nothing to update")
+
+    applied: List[str] = []
+
+    if 'name' in changes:
+        name = changes['name']
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("name must be a non-empty string")
+        workout_data['workoutName'] = name
+        applied.append(f"name -> {name!r}")
+
+    if 'description' in changes:
+        workout_data['description'] = changes['description']
+        applied.append("description updated")
+
+    step_changes = changes.get('steps') or []
+    if 'steps' in changes and not isinstance(step_changes, list):
+        raise ValueError("steps must be a list of step change objects")
+
+    if step_changes:
+        index = _index_steps_by_order(workout_data)
+
+        for position, change in enumerate(step_changes):
+            if not isinstance(change, dict):
+                raise ValueError(f"steps[{position}] must be an object")
+            order = change.get('order', change.get('step'))
+            if order is None:
+                raise ValueError(
+                    f"steps[{position}] is missing 'order' (the step's order "
+                    f"from get_workout_by_id)"
+                )
+            try:
+                order = int(order)
+            except (TypeError, ValueError):
+                raise ValueError(f"steps[{position}]: order must be an integer, got {order!r}")
+
+            step = index.get(order)
+            if step is None:
+                available = ", ".join(str(o) for o in sorted(index))
+                raise ValueError(
+                    f"steps[{position}]: no step with order {order}. "
+                    f"Available orders: {available}"
+                )
+
+            _apply_step_change(step, change, f"step[order={order}]")
+            applied.append(f"step {order} updated")
+
+    return applied
+
+
+def _prepare_workout_payload(workout_data: dict, workout_id: int) -> dict:
+    """Validate and normalize a workout DTO for a PUT to workout_id."""
+    _normalize_workout_steps(workout_data)
+    _validate_end_condition_steps(workout_data)
+    _validate_target_type_steps(workout_data)
+    # Never send a derived estimate: Garmin stores whatever it is given without
+    # checking it against the steps, so any carried-over value can outlive the
+    # edit that invalidated it. Absent, Garmin derives a correct one.
+    for container in (workout_data, *workout_data.get('workoutSegments', [])):
+        for field in _ESTIMATE_FIELDS:
+            container.pop(field, None)
+    # Garmin takes the id from the URL and ignores the body, but a mismatched
+    # body id makes the payload confusing to read back in a log.
+    workout_data['workoutId'] = workout_id
+    return workout_data
+
+
+def _put_workout(workout_id: int, workout_data: dict) -> None:
+    """PUT a complete workout DTO, replacing the workout in place.
+
+    Garmin answers with an empty body, so success is confirmed by re-reading
+    the workout rather than by inspecting the response.
+    """
+    garmin_client.client.put(
+        "connectapi",
+        f"/workout-service/workout/{workout_id}",
+        json=workout_data,
+        api=True,
+    )
+
+
+def _resolve_editable_workout_id(workout_id: Union[int, str]) -> int:
+    """Return a numeric workout id, rejecting ids that cannot be edited."""
+    workout_id_str = str(workout_id).strip()
+    if '-' in workout_id_str:
+        raise ValueError(
+            f"{workout_id_str} is a training-plan/Garmin Coach workout UUID. "
+            f"Those are generated by Garmin and cannot be edited; copy it into "
+            f"your own workout with upload_workout instead."
+        )
+    try:
+        numeric_id = int(workout_id_str)
+    except ValueError:
+        raise ValueError(f"Invalid workout_id {workout_id!r}: expected a numeric id")
+    if numeric_id <= 0:
+        raise ValueError(f"Invalid workout_id {numeric_id}: must be positive")
+    return numeric_id
 
 
 def _curate_workout_summary(workout: dict) -> dict:
@@ -991,6 +1276,240 @@ def register_tools(app):
             "failed": total - succeeded,
             "results": results
         }, indent=2)
+
+    @app.tool()
+    async def update_workout(workout_id: Union[int, str], changes: dict) -> str:
+        """Edit an existing workout in place, keeping its ID and calendar entries
+
+        Use this instead of delete + upload_workout when changing a workout that
+        already exists. The workout keeps its ID, so any calendar entry already
+        pointing at it stays valid and picks up the new content. Deleting and
+        re-uploading mints a new ID and leaves the old calendar entry orphaned.
+
+        The workout is read, patched, and written back, so only the fields you
+        name change; everything else is preserved exactly as Garmin has it.
+
+        Steps are addressed by "order" — the same value get_workout_by_id
+        reports for each step. Garmin numbers stepOrder globally across the
+        whole workout, so nested steps inside a repeat group have their own
+        unique orders (a repeat group at order 2 is followed by its children at
+        orders 3 and 4). Call get_workout_by_id first to see the orders.
+
+        This edits your own workouts. Garmin Coach / training-plan workouts are
+        identified by UUID and are generated by Garmin; they cannot be edited.
+
+        To add, remove, or reorder steps, use replace_workout — this tool edits
+        existing steps only.
+
+        changes accepts:
+            name (str): new workout name
+            description (str): new workout description
+            steps (list): per-step edits, each an object with:
+                order (int, required): the step's order from get_workout_by_id
+                description (str): step description
+                type (str): warmup, cooldown, interval, recovery, rest, repeat
+                end_condition (str): time, distance, lap.button, calories,
+                    heart.rate, iterations, reps, ...
+                end_condition_value (number): seconds for time, meters for
+                    distance, count for reps
+                target_type (str): no.target, heart.rate.zone, power.zone,
+                    pace.zone, power.between
+                target_zone (int): named zone number (HR 1-5, power 1-7).
+                    Setting this clears any custom range.
+                target_value_low / target_value_high (number): custom range,
+                    e.g. 105/143 bpm or 200/250 watts. Must be given together,
+                    and they clear any named zone.
+                repeat_count (int): iterations, for a repeat group step only
+
+        target_zone and target_value_low/high are mutually exclusive — Garmin
+        silently discards a custom range when a named zone is also present, so
+        passing both is rejected here.
+
+        Note: the workout itself updates immediately, but Garmin's calendar
+        summary caches the duration it recorded when the workout was scheduled.
+        get_scheduled_workouts may keep reporting the old
+        estimated_duration_seconds for an edited workout. The workout content
+        the watch receives is correct.
+
+        Examples:
+            Rename and stretch the main interval to 30 minutes:
+            update_workout(1234567890, {
+                "name": "Tempo 30min",
+                "steps": [{"order": 2, "end_condition_value": 1800}]
+            })
+
+            Change a repeat group to 6 reps and drop the recovery to Z1:
+            update_workout(1234567890, {
+                "steps": [
+                    {"order": 2, "repeat_count": 6},
+                    {"order": 4, "target_zone": 1}
+                ]
+            })
+
+            Swap a named zone for an exact bpm range:
+            update_workout(1234567890, {
+                "steps": [{"order": 3, "target_value_low": 136,
+                           "target_value_high": 148}]
+            })
+
+        Args:
+            workout_id: Numeric ID of the workout to edit (from get_workouts)
+            changes: Change spec as described above
+        """
+        try:
+            numeric_id = _resolve_editable_workout_id(workout_id)
+            workout = garmin_client.get_workout_by_id(numeric_id)
+            if not workout:
+                return json.dumps({
+                    "status": "failed",
+                    "workout_id": numeric_id,
+                    "message": f"No workout found with ID {numeric_id}",
+                }, indent=2)
+
+            applied = _apply_workout_changes(workout, changes)
+            _prepare_workout_payload(workout, numeric_id)
+            _put_workout(numeric_id, workout)
+
+            # Garmin's PUT returns an empty body, so read the workout back to
+            # report what it actually stored rather than what we sent.
+            updated = garmin_client.get_workout_by_id(numeric_id)
+            return json.dumps({
+                "status": "success",
+                "workout_id": numeric_id,
+                "applied": applied,
+                "message": (
+                    f"Workout {numeric_id} updated in place; ID and any "
+                    f"calendar entries preserved"
+                ),
+                "workout": _curate_workout_details(updated or {}),
+            }, indent=2)
+        except Exception as e:
+            return json.dumps({
+                "status": "failed",
+                "workout_id": workout_id,
+                "message": f"Error updating workout: {str(e)}",
+            }, indent=2)
+
+    @app.tool()
+    async def update_workouts(updates: list[dict]) -> str:
+        """Edit multiple existing workouts in place in a single call
+
+        Each workout keeps its ID and calendar entries. See update_workout for
+        the full change spec, step addressing rules, and caveats.
+
+        Each update is applied independently: one failure does not stop the
+        others, and every result is reported.
+
+        Args:
+            updates: List of objects, each with:
+                - workout_id (int): numeric ID of the workout to edit
+                - changes (dict): change spec, same format as update_workout
+
+        Example:
+            [{"workout_id": 123, "changes": {"name": "Week 1 Tempo"}},
+             {"workout_id": 456, "changes": {
+                 "steps": [{"order": 2, "end_condition_value": 2400}]}}]
+        """
+        results = []
+        for position, update in enumerate(updates):
+            workout_id = update.get("workout_id") if isinstance(update, dict) else None
+            try:
+                if not isinstance(update, dict):
+                    raise ValueError(f"updates[{position}] must be an object")
+                if workout_id is None:
+                    raise ValueError(f"updates[{position}] is missing workout_id")
+                changes = update.get("changes")
+                if not isinstance(changes, dict):
+                    raise ValueError(
+                        f"updates[{position}] is missing a 'changes' object"
+                    )
+
+                numeric_id = _resolve_editable_workout_id(workout_id)
+                workout = garmin_client.get_workout_by_id(numeric_id)
+                if not workout:
+                    raise ValueError(f"No workout found with ID {numeric_id}")
+
+                applied = _apply_workout_changes(workout, changes)
+                _prepare_workout_payload(workout, numeric_id)
+                _put_workout(numeric_id, workout)
+
+                updated = garmin_client.get_workout_by_id(numeric_id)
+                results.append({
+                    "status": "success",
+                    "workout_id": numeric_id,
+                    "name": (updated or {}).get("workoutName"),
+                    "applied": applied,
+                    "message": f"Workout {numeric_id} updated in place",
+                })
+            except Exception as e:
+                results.append({
+                    "status": "error",
+                    "workout_id": workout_id,
+                    "message": f"Error updating workout: {str(e)}",
+                })
+
+        total = len(results)
+        succeeded = sum(1 for r in results if r["status"] == "success")
+        return json.dumps({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": total - succeeded,
+            "results": results,
+        }, indent=2)
+
+    @app.tool()
+    async def replace_workout(workout_id: Union[int, str], workout_data: dict) -> str:
+        """Replace an existing workout's entire content, keeping its ID
+
+        Overwrites the workout with the structure you provide, while keeping the
+        workout ID — so calendar entries pointing at it stay valid and follow
+        the new content. Use this when the step list itself changes: adding,
+        removing, or reordering steps, or switching sport type.
+
+        For editing values on existing steps (durations, targets, names), prefer
+        update_workout — it patches the workout Garmin already has instead of
+        requiring you to restate the whole thing.
+
+        workout_data uses exactly the same structure as upload_workout, and the
+        same rules apply for step DTO types, end-condition IDs, target-type IDs,
+        and heart-rate zone versus custom range. Anything you omit is dropped
+        from the workout, so pass the complete intended structure.
+
+        Note: Garmin's calendar summary caches the duration recorded when the
+        workout was scheduled, so get_scheduled_workouts may keep reporting the
+        old estimated_duration_seconds. The workout content is correct.
+
+        Args:
+            workout_id: Numeric ID of the workout to overwrite (from get_workouts)
+            workout_data: Complete workout structure, same format as upload_workout
+        """
+        try:
+            numeric_id = _resolve_editable_workout_id(workout_id)
+            if not isinstance(workout_data, dict) or not workout_data.get('workoutSegments'):
+                raise ValueError(
+                    "workout_data must be a complete workout including "
+                    "workoutSegments; Garmin rejects a partial body"
+                )
+
+            _prepare_workout_payload(workout_data, numeric_id)
+            _put_workout(numeric_id, workout_data)
+
+            updated = garmin_client.get_workout_by_id(numeric_id)
+            return json.dumps({
+                "status": "success",
+                "workout_id": numeric_id,
+                "message": (
+                    f"Workout {numeric_id} replaced in place; ID and any "
+                    f"calendar entries preserved"
+                ),
+                "workout": _curate_workout_details(updated or {}),
+            }, indent=2)
+        except Exception as e:
+            return json.dumps({
+                "status": "failed",
+                "workout_id": workout_id,
+                "message": f"Error replacing workout: {str(e)}",
+            }, indent=2)
 
     @app.tool()
     async def delete_workout(workout_id: int) -> str:
