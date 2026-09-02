@@ -27,7 +27,7 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 
 This MCP server implements **110+ tools** covering ~90% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.3.2):
 
-- ✅ Activity Management (20 tools) - includes write tools for type, description, event type, perceived effort, and feel
+- ✅ Activity Management (22 tools) - includes write tools for type, description, event type, perceived effort, and feel, plus activity upload and deletion
 - ✅ Health & Wellness (31 tools) - includes custom lightweight summary tools
 - ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
 - ✅ Workouts (11 tools) - includes in-place editing that preserves workout IDs and calendar entries
@@ -44,6 +44,57 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 - ✅ Activity File Downloads (2 tools) - download activity files in FIT, GPX, TCX, or CSV format
 
 > **Note:** Activity Analysis tools require a compatible power meter (e.g., Garmin Rally, Favero Assioma, PowerTap P1) and/or Shimano Di2 / SRAM eTap electronic shifting. The `fitparse` dependency is installed automatically.
+
+### Replacing a bad recording
+
+When an activity is recorded with corrupt data — a power meter dropping out
+mid-ride, say — and a second recording of the same effort exists as a file
+(the FIT that MyWhoosh, Zwift or TrainerRoad writes), two tools let you swap
+one for the other.
+
+- **`upload_activity(file_path, name=None, description=None, activity_type=None)`** —
+  uploads a `.fit`, `.gpx` or `.tcx` file. The extension is checked before any
+  network call. `name`, `description` and `activity_type` are applied after the
+  upload lands.
+- **`delete_activity(activity_id, confirm_name)`** — permanently deletes an
+  activity. `confirm_name` must match the activity's current name, so a
+  mistyped ID fails instead of destroying whatever it points at. The response
+  reports the ID, name, start time, duration and distance of what was deleted,
+  since you can no longer go and look.
+
+The two are deliberately separate, and there is no combined "replace" tool.
+Keeping a stop between the destruction and the creation means you can confirm
+the new file is good before the old one is gone. Download the original first
+with `download_activity_file` if there is any chance you will want it back —
+Garmin has no trash and no undo for activities.
+
+**Duplicates.** Garmin refuses a file whose time range overlaps an activity it
+already holds. That is the normal case in this workflow, not an error, so
+`upload_activity` reports it rather than raising:
+
+```json
+{
+  "status": "duplicate",
+  "existing_activity_id": 24215020608,
+  "message": "Garmin rejected this file as a duplicate ..."
+}
+```
+
+Inspect that activity, delete it, then upload again.
+
+**Notes and caveats**
+
+- A `.fit` file is imported inline and its new activity ID comes straight back.
+  `.gpx` and `.tcx` are queued instead: Garmin returns no ID and exposes no
+  upload-status endpoint, so the new activity is found by diffing the activity
+  index around the file's own date. If that does not settle within a few
+  seconds the status is `queued` and you must find the activity yourself with
+  `get_activities_by_date`; no metadata is applied in that case.
+- A failure to apply `name`, `description` or `activity_type` comes back as a
+  warning, not a failed upload. The file is already on Garmin at that point,
+  and re-uploading would only hit the duplicate check.
+- After a delete, `get_activity` 404s immediately but the activity list is
+  eventually consistent and may keep returning the activity for a short while.
 
 ### Activity File Downloads
 

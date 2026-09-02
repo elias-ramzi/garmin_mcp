@@ -3,7 +3,13 @@ Activity Management functions for Garmin Connect MCP Server
 """
 import json
 import datetime
+import os
+import pathlib
+import re
+import time
 from typing import Any, Dict, List, Optional, Union
+
+import requests
 
 # The garmin_client will be set by the main file
 garmin_client = None
@@ -41,6 +47,142 @@ def _update_activity_summary(activity_id: int, fields: Dict[str, Any]) -> Any:
     sidesteps it.
     """
     return _put_activity_update(activity_id, {"summaryDTO": fields})
+
+
+# --- Activity file upload / deletion ---------------------------------------
+#
+# Garmin's upload service answers in three shapes, all confirmed against the
+# live API:
+#
+#   201 + detailedImportResult.successes[0].internalId
+#       imported inline; that id is the new activity
+#   202 + successes and failures both empty
+#       queued for background import; no id is returned at all
+#   409 + detailedImportResult.failures[0].internalId
+#       refused as a duplicate; that id is the activity already occupying the
+#       file's time range
+#
+# There is no upload-status endpoint to follow up a 202 with: every documented
+# path under upload-service and activity-service returns 404 or 405.
+
+_ACTIVITY_UPLOAD_EXTENSIONS = (".fit", ".gpx", ".tcx")
+_UPLOAD_TIMEOUT_S = 120
+
+# A queued import lands in the activity index almost immediately, but poll a
+# few times rather than assume it.
+_UPLOAD_SETTLE_ATTEMPTS = 6
+_UPLOAD_SETTLE_DELAY_S = 1.0
+
+# GPX writes <time>, TCX writes <Time>; both are ISO-8601 and the first one in
+# the file belongs to the first trackpoint.
+_XML_TIME_RE = re.compile(r"<time>\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+_XML_HEAD_BYTES = 1_048_576
+
+
+def _deletion_receipt(activity: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize an activity so the caller can prove what was destroyed.
+
+    Deletion is final and the activity stops being readable, so this is the
+    only record of it that survives the call.
+    """
+    summary = activity.get("summaryDTO") or {}
+    return {
+        "activity_id": activity.get("activityId"),
+        "activity_name": activity.get("activityName"),
+        "activity_type": (activity.get("activityTypeDTO") or {}).get("typeKey"),
+        "start_time_local": summary.get("startTimeLocal"),
+        "start_time_gmt": summary.get("startTimeGMT"),
+        "duration_seconds": summary.get("duration"),
+        "distance_meters": summary.get("distance"),
+    }
+
+
+def _post_activity_file(file_path: str) -> Any:
+    """POST an activity file to the upload service and return the raw response.
+
+    This deliberately bypasses garmin_client.upload_activity. That helper routes
+    through the shared client, which collapses every HTTP >= 400 into a
+    GarminConnectConnectionError carrying nothing but a message string. Garmin
+    reports a duplicate as a 409 whose body names the conflicting activity, so
+    going through the client would discard the one field the caller needs to
+    resolve the conflict.
+    """
+    url = f"https://connectapi.{garmin_client.client.domain}/upload-service/upload"
+
+    def post():
+        with open(file_path, "rb") as handle:
+            return requests.post(
+                url,
+                headers=garmin_client.client.get_api_headers(),
+                files={"file": (os.path.basename(file_path), handle)},
+                timeout=_UPLOAD_TIMEOUT_S,
+            )
+
+    response = post()
+    if response.status_code == 401:
+        # get_api_headers hands back whichever token the client is holding; only
+        # a request made through the client itself refreshes an expired one.
+        garmin_client.get_userprofile_settings()
+        response = post()
+    return response
+
+
+def _failure_messages(failures: List[Dict[str, Any]]) -> List[str]:
+    """Flatten Garmin's nested import failure messages into plain strings."""
+    return [
+        message["content"]
+        for failure in failures
+        for message in (failure.get("messages") or [])
+        if message.get("content")
+    ]
+
+
+def _xml_activity_date(file_path: str) -> Optional[str]:
+    """Read the first timestamp out of a GPX or TCX file, as YYYY-MM-DD."""
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+        match = _XML_TIME_RE.search(handle.read(_XML_HEAD_BYTES))
+    return match.group(1) if match else None
+
+
+def _shift_date(date_str: str, days: int) -> str:
+    parsed = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    return (parsed + datetime.timedelta(days=days)).isoformat()
+
+
+def _activity_ids_around(date_str: str) -> set:
+    """IDs of activities within a day of date_str, to diff against after upload.
+
+    The window absorbs the timezone gap between the file's timestamps (UTC) and
+    the local start date Garmin indexes the activity under.
+    """
+    found = garmin_client.get_activities_by_date(
+        _shift_date(date_str, -1), _shift_date(date_str, 1)
+    ) or []
+    return {a.get("activityId") for a in found if a.get("activityId") is not None}
+
+
+def _await_queued_activity(date_str: str, known_ids: set) -> Optional[int]:
+    """Poll the activity index for the activity a queued upload produced."""
+    for attempt in range(_UPLOAD_SETTLE_ATTEMPTS):
+        if attempt:
+            time.sleep(_UPLOAD_SETTLE_DELAY_S)
+        for activity_id in _activity_ids_around(date_str) - known_ids:
+            return activity_id
+    return None
+
+
+def _note_failure(warnings: List[str], field: str, result: str) -> None:
+    """Record a post-upload metadata update that did not take.
+
+    The tools being reused swallow their own errors and report through their
+    return value, so success has to be read back out of what they returned.
+    """
+    try:
+        if json.loads(result).get("success"):
+            return
+    except (ValueError, AttributeError, TypeError):
+        pass
+    warnings.append(f"{field} was not applied: {result}")
 
 
 def register_tools(app):
@@ -937,6 +1079,208 @@ def register_tools(app):
             }, indent=2)
         except Exception as e:
             return f"Error creating manual activity: {str(e)}"
+
+    @app.tool()
+    async def delete_activity(activity_id: Union[int, str], confirm_name: str) -> str:
+        """Permanently delete an activity from Garmin Connect.
+
+        This is irreversible. Garmin offers no trash and no undo for activities:
+        once the call returns, the recording and every metric derived from it are
+        gone. If there is any chance the data will be wanted again, save it first
+        with download_activity_file.
+
+        confirm_name guards against destroying the wrong activity. It must match
+        the activity's current name, so a mistyped id fails instead of deleting
+        whatever it happens to point at, and the caller has to have read the
+        activity before it can destroy it. A mismatch reports the real name so
+        the call can be corrected.
+
+        Args:
+            activity_id: ID of the activity to delete
+            confirm_name: The activity's exact current name, as confirmation.
+                Surrounding whitespace is ignored; nothing else is.
+        """
+        try:
+            activity_id = int(activity_id)
+            activity = garmin_client.get_activity(activity_id)
+            if not activity:
+                return f"No activity found with ID {activity_id}"
+
+            actual_name = activity.get("activityName") or ""
+            if confirm_name.strip() != actual_name.strip():
+                return json.dumps({
+                    "success": False,
+                    "activity_id": activity_id,
+                    "actual_name": actual_name,
+                    "message": (
+                        f"confirm_name does not match: activity {activity_id} is "
+                        f"named '{actual_name}'. Nothing was deleted. Pass that "
+                        f"exact name as confirm_name to delete it."
+                    ),
+                }, indent=2)
+
+            # Read the summary out before it stops being retrievable.
+            receipt = _deletion_receipt(activity)
+            garmin_client.delete_activity(str(activity_id))
+
+            return json.dumps({
+                "success": True,
+                "deleted": receipt,
+                "message": (
+                    "Activity permanently deleted. This cannot be undone. Note "
+                    "that the activity list is eventually consistent and may keep "
+                    "returning it for a short while."
+                ),
+            }, indent=2)
+        except Exception as e:
+            return f"Error deleting activity: {str(e)}"
+
+    @app.tool()
+    async def upload_activity(
+        file_path: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        activity_type: Optional[str] = None,
+    ) -> str:
+        """Upload an activity file to Garmin Connect.
+
+        Accepts .fit, .gpx and .tcx — for example the FIT file a trainer app such
+        as MyWhoosh, Zwift or TrainerRoad writes for a ride that Garmin recorded
+        badly or not at all.
+
+        Garmin refuses a file whose time range overlaps an activity that already
+        exists. That is reported as status "duplicate", not as an error, and the
+        response carries existing_activity_id so the conflict can be resolved:
+        inspect that activity, and delete it with delete_activity before
+        re-uploading if the new file really is the better recording.
+
+        A FIT file is imported inline and its new activity id comes straight back.
+        GPX and TCX are queued instead, so the id is looked up afterwards; if that
+        lookup does not settle in a few seconds the status is "queued" and the
+        activity has to be found with get_activities_by_date.
+
+        name, description and activity_type are applied after the upload
+        succeeds. A failure to apply one of them is reported as a warning rather
+        than as a failed upload — the file is already on Garmin at that point, and
+        retrying the upload would only hit the duplicate check.
+
+        Args:
+            file_path: Path to the activity file (.fit, .gpx or .tcx)
+            name: Optional name to set on the uploaded activity
+            description: Optional description (notes) to set on it
+            activity_type: Optional type key to set, e.g. "cycling",
+                "virtual_ride". See get_activity_types for the full list.
+        """
+        try:
+            path = pathlib.Path(file_path).expanduser()
+            suffix = path.suffix.lower()
+            if suffix not in _ACTIVITY_UPLOAD_EXTENSIONS:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"Unsupported file type '{suffix or '(no extension)'}'. "
+                        f"Garmin accepts "
+                        f"{', '.join(_ACTIVITY_UPLOAD_EXTENSIONS)}."
+                    ),
+                }, indent=2)
+            resolved = str(path.resolve())
+            if not os.path.isfile(resolved):
+                return json.dumps({
+                    "success": False,
+                    "error": f"Activity file not found: {resolved}",
+                }, indent=2)
+
+            # Only XML formats get queued, and resolving a queued import means
+            # diffing the activity index — which has to be sampled beforehand.
+            queued_date = _xml_activity_date(resolved) if suffix != ".fit" else None
+            known_ids = _activity_ids_around(queued_date) if queued_date else set()
+
+            response = _post_activity_file(resolved)
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            result = body.get("detailedImportResult") or {}
+            failures = result.get("failures") or []
+            successes = result.get("successes") or []
+            messages = _failure_messages(failures)
+
+            if response.status_code == 409:
+                return json.dumps({
+                    "status": "duplicate",
+                    "success": False,
+                    "file": resolved,
+                    "existing_activity_id": (
+                        failures[0].get("internalId") if failures else None
+                    ),
+                    "message": (
+                        f"Garmin rejected this file as a duplicate of an activity "
+                        f"it already has ({'; '.join(messages) or 'Duplicate Activity.'}). "
+                        f"Inspect the existing activity, and delete it with "
+                        f"delete_activity before re-uploading if this file should "
+                        f"replace it."
+                    ),
+                }, indent=2)
+
+            if response.status_code >= 400 or messages:
+                return json.dumps({
+                    "status": "error",
+                    "success": False,
+                    "file": resolved,
+                    "http_status": response.status_code,
+                    "message": (
+                        "; ".join(messages)
+                        or f"Garmin rejected the upload (HTTP {response.status_code})."
+                    ),
+                }, indent=2)
+
+            activity_id = successes[0].get("internalId") if successes else None
+            if activity_id is None and queued_date:
+                activity_id = _await_queued_activity(queued_date, known_ids)
+
+            if activity_id is None:
+                return json.dumps({
+                    "status": "queued",
+                    "success": True,
+                    "file": resolved,
+                    "upload_id": result.get("uploadId"),
+                    "message": (
+                        "Garmin accepted the file but has not finished importing "
+                        "it, so no activity ID is available yet. Find the new "
+                        "activity with get_activities_by_date, then set its name, "
+                        "description or type directly. It was not applied here."
+                    ),
+                }, indent=2)
+
+            warnings = []
+            if name is not None:
+                _note_failure(warnings, "name",
+                              await set_activity_name(activity_id, name))
+            if description is not None:
+                _note_failure(warnings, "description",
+                              await set_activity_description(activity_id, description))
+            if activity_type is not None:
+                _note_failure(warnings, "activity_type",
+                              await set_activity_type(activity_id, activity_type))
+
+            payload = {
+                "status": "success",
+                "success": True,
+                "activity_id": activity_id,
+                "file": resolved,
+                "upload_id": result.get("uploadId"),
+                "message": "Activity uploaded.",
+            }
+            if warnings:
+                payload["warnings"] = warnings
+                payload["message"] = (
+                    "Activity uploaded, but some metadata was not applied. The "
+                    "upload itself succeeded — set the remaining fields directly "
+                    "rather than uploading the file again."
+                )
+            return json.dumps(payload, indent=2)
+        except Exception as e:
+            return f"Error uploading activity: {str(e)}"
 
     @app.tool()
     async def get_activity_types() -> str:

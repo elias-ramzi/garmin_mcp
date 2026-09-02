@@ -1068,3 +1068,340 @@ async def test_create_manual_activity_exception(app_with_activity_management, mo
     )
     assert "Error" in result[0][0].text
     assert "Garmin API error" in result[0][0].text
+
+
+# --- delete_activity / upload_activity --------------------------------------
+#
+# The response shapes asserted here were taken from the live Garmin upload
+# service: a FIT is imported inline and its id comes back under successes, a
+# GPX is queued with both lists empty, and a duplicate is a 409 whose
+# failures[0].internalId names the activity already holding that time range.
+
+
+MOCK_ACTIVITY_TO_DELETE = {
+    "activityId": 24215020608,
+    "activityName": "Evening Ride",
+    "activityTypeDTO": {"typeKey": "virtual_ride"},
+    "summaryDTO": {
+        "startTimeLocal": "2026-09-01T18:36:42.0",
+        "startTimeGMT": "2026-09-01T16:36:42.0",
+        "duration": 3600.0,
+        "distance": 30000.0,
+    },
+}
+
+
+def _upload_response(status_code, body):
+    response = Mock()
+    response.status_code = status_code
+    response.json.return_value = body
+    return response
+
+
+def _import_result(successes=(), failures=(), upload_id=477692315276):
+    return {
+        "detailedImportResult": {
+            "uploadId": upload_id,
+            "successes": list(successes),
+            "failures": list(failures),
+        }
+    }
+
+
+def _fit(tmp_path, name="ride.fit"):
+    path = tmp_path / name
+    path.write_bytes(b"\x0e\x10fake fit")
+    return str(path)
+
+
+@pytest.fixture
+def mock_upload(mocker):
+    """Patch the raw upload POST, defaulting to an inline FIT import."""
+    return mocker.patch(
+        "garmin_mcp.activity_management._post_activity_file",
+        return_value=_upload_response(201, _import_result(
+            successes=[{"internalId": 99887766, "externalId": "abc"}]
+        )),
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_activity_requires_matching_confirm_name(
+    app_with_activity_management, mock_garmin_client
+):
+    """A confirm_name that does not match aborts without touching Garmin."""
+    mock_garmin_client.get_activity.return_value = MOCK_ACTIVITY_TO_DELETE
+
+    result = await app_with_activity_management.call_tool(
+        "delete_activity",
+        {"activity_id": 24215020608, "confirm_name": "Morning Ride"},
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["success"] is False
+    # The real name comes back so the caller can correct the call.
+    assert payload["actual_name"] == "Evening Ride"
+    mock_garmin_client.delete_activity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_activity_returns_receipt_of_what_was_deleted(
+    app_with_activity_management, mock_garmin_client
+):
+    """The deleted activity's details survive the call that destroys them."""
+    mock_garmin_client.get_activity.return_value = MOCK_ACTIVITY_TO_DELETE
+
+    result = await app_with_activity_management.call_tool(
+        "delete_activity",
+        {"activity_id": 24215020608, "confirm_name": "Evening Ride"},
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["success"] is True
+    assert payload["deleted"] == {
+        "activity_id": 24215020608,
+        "activity_name": "Evening Ride",
+        "activity_type": "virtual_ride",
+        "start_time_local": "2026-09-01T18:36:42.0",
+        "start_time_gmt": "2026-09-01T16:36:42.0",
+        "duration_seconds": 3600.0,
+        "distance_meters": 30000.0,
+    }
+    mock_garmin_client.delete_activity.assert_called_once_with("24215020608")
+
+
+@pytest.mark.asyncio
+async def test_delete_activity_reports_missing_activity(
+    app_with_activity_management, mock_garmin_client
+):
+    """An id that resolves to nothing is reported, not deleted."""
+    mock_garmin_client.get_activity.return_value = None
+
+    result = await app_with_activity_management.call_tool(
+        "delete_activity", {"activity_id": 1, "confirm_name": "Whatever"}
+    )
+
+    assert "No activity found" in result[0][0].text
+    mock_garmin_client.delete_activity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_rejects_unsupported_extension(
+    app_with_activity_management, tmp_path, mock_upload
+):
+    """An unsupported extension fails before any network call."""
+    bad = tmp_path / "ride.csv"
+    bad.write_text("not an activity")
+
+    result = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": str(bad)}
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["success"] is False
+    assert ".fit" in payload["error"]
+    mock_upload.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_rejects_missing_file(
+    app_with_activity_management, tmp_path, mock_upload
+):
+    """A path that does not exist fails before any network call."""
+    result = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": str(tmp_path / "absent.fit")}
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["success"] is False
+    assert "not found" in payload["error"]
+    mock_upload.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_returns_new_activity_id(
+    app_with_activity_management, tmp_path, mock_upload
+):
+    """A FIT import returns the id Garmin reports inline."""
+    result = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": _fit(tmp_path)}
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["status"] == "success"
+    # The id has to be usable as-is by get_activity, so it stays an int.
+    assert payload["activity_id"] == 99887766
+    assert "warnings" not in payload
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_id_is_usable_by_get_activity(
+    app_with_activity_management, mock_garmin_client, tmp_path, mock_upload
+):
+    """The returned id round-trips through get_activity."""
+    uploaded = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": _fit(tmp_path)}
+    )
+    activity_id = json.loads(uploaded[0][0].text)["activity_id"]
+
+    mock_garmin_client.get_activity.return_value = {
+        "activityId": activity_id,
+        "activityName": "Uploaded Ride",
+        "summaryDTO": {"duration": 3600.0},
+    }
+    fetched = await app_with_activity_management.call_tool(
+        "get_activity", {"activity_id": activity_id}
+    )
+
+    assert json.loads(fetched[0][0].text)["id"] == activity_id
+    mock_garmin_client.get_activity.assert_called_with(activity_id)
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_reports_duplicate_instead_of_raising(
+    app_with_activity_management, tmp_path, mock_upload
+):
+    """A 409 becomes a readable duplicate status naming the conflicting id."""
+    mock_upload.return_value = _upload_response(409, _import_result(
+        failures=[{
+            "internalId": 24215020608,
+            "messages": [{"code": 202, "content": "Duplicate Activity."}],
+        }],
+    ))
+
+    result = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": _fit(tmp_path)}
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["status"] == "duplicate"
+    assert payload["success"] is False
+    # Without this id the caller cannot find what to delete before retrying.
+    assert payload["existing_activity_id"] == 24215020608
+    assert "Duplicate Activity." in payload["message"]
+    assert "delete_activity" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_applies_metadata_after_upload(
+    app_with_activity_management, mock_garmin_client, tmp_path, mock_upload
+):
+    """name, description and activity_type are applied to the new activity."""
+    mock_garmin_client.get_activity_types.return_value = MOCK_ACTIVITY_TYPES
+
+    result = await app_with_activity_management.call_tool(
+        "upload_activity",
+        {
+            "file_path": _fit(tmp_path),
+            "name": "MyWhoosh replacement",
+            "description": "Re-uploaded after power dropout",
+            "activity_type": MOCK_ACTIVITY_TYPES[0]["typeKey"],
+        },
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["status"] == "success"
+    assert "warnings" not in payload
+    mock_garmin_client.set_activity_name.assert_called_once_with(
+        99887766, "MyWhoosh replacement"
+    )
+    mock_garmin_client.set_activity_type.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_warns_when_metadata_fails(
+    app_with_activity_management, mock_garmin_client, tmp_path, mock_upload
+):
+    """A failed rename is a warning, not a failed upload.
+
+    Reporting it as a failure would invite a retry, and the retry would be
+    refused as a duplicate of the file that just landed.
+    """
+    mock_garmin_client.set_activity_name.side_effect = Exception("rename refused")
+
+    result = await app_with_activity_management.call_tool(
+        "upload_activity",
+        {"file_path": _fit(tmp_path), "name": "Renamed"},
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["success"] is True
+    assert payload["activity_id"] == 99887766
+    assert any("rename refused" in w for w in payload["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_resolves_queued_gpx_id(
+    app_with_activity_management, mock_garmin_client, tmp_path, mock_upload
+):
+    """A queued GPX import is resolved by diffing the activity index.
+
+    Garmin returns 202 with no id for GPX and offers no upload-status endpoint,
+    so the new activity is found by what appeared around the file's own date.
+    """
+    gpx = tmp_path / "ride.gpx"
+    gpx.write_text(
+        '<?xml version="1.0"?><gpx><trk><trkseg>'
+        '<trkpt lat="48.85" lon="2.35"><time>2026-03-14T09:00:00Z</time></trkpt>'
+        "</trkseg></trk></gpx>"
+    )
+    mock_upload.return_value = _upload_response(202, _import_result())
+    mock_garmin_client.get_activities_by_date.side_effect = [
+        [{"activityId": 111}],                        # before the upload
+        [{"activityId": 111}, {"activityId": 222}],   # after it settles
+    ]
+
+    result = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": str(gpx)}
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["status"] == "success"
+    assert payload["activity_id"] == 222
+    # The window spans the file's date to absorb the local/UTC offset.
+    assert mock_garmin_client.get_activities_by_date.call_args_list[0][0] == (
+        "2026-03-13", "2026-03-15",
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_reports_queued_when_id_never_appears(
+    app_with_activity_management, mock_garmin_client, tmp_path, mock_upload, mocker
+):
+    """An import that never settles is reported as queued, not as success."""
+    mocker.patch("garmin_mcp.activity_management._UPLOAD_SETTLE_DELAY_S", 0)
+    gpx = tmp_path / "ride.gpx"
+    gpx.write_text("<gpx><time>2026-03-14T09:00:00Z</time></gpx>")
+    mock_upload.return_value = _upload_response(202, _import_result())
+    mock_garmin_client.get_activities_by_date.return_value = [{"activityId": 111}]
+
+    result = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": str(gpx), "name": "Ignored"}
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["status"] == "queued"
+    assert payload["upload_id"] == 477692315276
+    # No id means the metadata could not have been applied; say so.
+    assert "not applied here" in payload["message"]
+    mock_garmin_client.set_activity_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_activity_reports_other_errors(
+    app_with_activity_management, tmp_path, mock_upload
+):
+    """A non-409 rejection is surfaced with Garmin's own message."""
+    mock_upload.return_value = _upload_response(400, _import_result(
+        failures=[{"messages": [{"code": 1, "content": "Unsupported file."}]}],
+    ))
+
+    result = await app_with_activity_management.call_tool(
+        "upload_activity", {"file_path": _fit(tmp_path)}
+    )
+    payload = json.loads(result[0][0].text)
+
+    assert payload["status"] == "error"
+    assert payload["success"] is False
+    assert payload["http_status"] == 400
+    assert "Unsupported file." in payload["message"]
