@@ -27,10 +27,10 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 
 This MCP server implements **110+ tools** covering ~90% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.3.2):
 
-- ✅ Activity Management (20 tools) - includes write tools for type, description, event type, perceived effort, and feel
+- ✅ Activity Management (22 tools) - includes write tools for type, description, event type, perceived effort, and feel, plus activity upload and deletion
 - ✅ Health & Wellness (31 tools) - includes custom lightweight summary tools
 - ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
-- ✅ Workouts (8 tools)
+- ✅ Workouts (11 tools) - includes in-place editing that preserves workout IDs and calendar entries
 - ✅ Devices (7 tools)
 - ✅ Gear Management (5 tools)
 - ✅ Weight Tracking (5 tools)
@@ -44,6 +44,57 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 - ✅ Activity File Downloads (2 tools) - download activity files in FIT, GPX, TCX, or CSV format
 
 > **Note:** Activity Analysis tools require a compatible power meter (e.g., Garmin Rally, Favero Assioma, PowerTap P1) and/or Shimano Di2 / SRAM eTap electronic shifting. The `fitparse` dependency is installed automatically.
+
+### Replacing a bad recording
+
+When an activity is recorded with corrupt data — a power meter dropping out
+mid-ride, say — and a second recording of the same effort exists as a file
+(the FIT that MyWhoosh, Zwift or TrainerRoad writes), two tools let you swap
+one for the other.
+
+- **`upload_activity(file_path, name=None, description=None, activity_type=None)`** —
+  uploads a `.fit`, `.gpx` or `.tcx` file. The extension is checked before any
+  network call. `name`, `description` and `activity_type` are applied after the
+  upload lands.
+- **`delete_activity(activity_id, confirm_name)`** — permanently deletes an
+  activity. `confirm_name` must match the activity's current name, so a
+  mistyped ID fails instead of destroying whatever it points at. The response
+  reports the ID, name, start time, duration and distance of what was deleted,
+  since you can no longer go and look.
+
+The two are deliberately separate, and there is no combined "replace" tool.
+Keeping a stop between the destruction and the creation means you can confirm
+the new file is good before the old one is gone. Download the original first
+with `download_activity_file` if there is any chance you will want it back —
+Garmin has no trash and no undo for activities.
+
+**Duplicates.** Garmin refuses a file whose time range overlaps an activity it
+already holds. That is the normal case in this workflow, not an error, so
+`upload_activity` reports it rather than raising:
+
+```json
+{
+  "status": "duplicate",
+  "existing_activity_id": 24215020608,
+  "message": "Garmin rejected this file as a duplicate ..."
+}
+```
+
+Inspect that activity, delete it, then upload again.
+
+**Notes and caveats**
+
+- A `.fit` file is imported inline and its new activity ID comes straight back.
+  `.gpx` and `.tcx` are queued instead: Garmin returns no ID and exposes no
+  upload-status endpoint, so the new activity is found by diffing the activity
+  index around the file's own date. If that does not settle within a few
+  seconds the status is `queued` and you must find the activity yourself with
+  `get_activities_by_date`; no metadata is applied in that case.
+- A failure to apply `name`, `description` or `activity_type` comes back as a
+  warning, not a failed upload. The file is already on Garmin at that point,
+  and re-uploading would only hit the duplicate check.
+- After a delete, `get_activity` 404s immediately but the activity list is
+  eventually consistent and may keep returning the activity for a short while.
 
 ### Activity File Downloads
 
@@ -190,6 +241,71 @@ schedule_workout(workout_id=1560092011, date="2026-05-06")
 ```
 
 After syncing your watch, the workout appears on the Forerunner 965 calendar.
+
+## Editing workouts in place
+
+`update_workout`, `update_workouts`, and `replace_workout` change an existing
+workout without replacing it. Garmin supports this through
+`PUT /workout-service/workout/{workoutId}`, which the workout keeps its ID
+through — so a calendar entry that already points at the workout stays valid and
+picks up the new content. Deleting and re-uploading does not: it mints a new ID
+and orphans the schedule.
+
+### `update_workout`
+
+Patches named fields and leaves the rest of the workout exactly as Garmin has
+it. Steps are addressed by `order`, the same value `get_workout_by_id` reports.
+Garmin numbers `stepOrder` globally across the whole workout, so steps nested in
+a repeat group have their own unique orders — a repeat group at order 2 is
+followed by its children at orders 3 and 4, and the next top-level step
+continues at 5.
+
+```json
+{
+  "workout_id": 1234567890,
+  "changes": {
+    "name": "Tempo 30min",
+    "steps": [
+      {"order": 2, "repeat_count": 6},
+      {"order": 3, "end_condition_value": 1800, "target_zone": 4},
+      {"order": 4, "target_value_low": 136, "target_value_high": 148}
+    ]
+  }
+}
+```
+
+Per-step fields: `description`, `type`, `end_condition`, `end_condition_value`,
+`target_type`, `target_zone`, `target_value_low` / `target_value_high`, and
+`repeat_count` for repeat groups. `target_zone` and `target_value_low`/`high`
+are mutually exclusive — Garmin silently discards a custom range when a named
+zone is also present, so passing both is rejected.
+
+Returns `{"status": "success", "applied": [...], "workout": {...}}`, where
+`workout` is the workout re-read from Garmin after the write.
+
+### `replace_workout`
+
+Overwrites the whole structure while keeping the ID. Use it when the step list
+itself changes — adding, removing, or reordering steps, or switching sport. It
+takes the same `workout_data` structure as `upload_workout`, and anything
+omitted is dropped from the workout.
+
+### Notes and caveats
+
+- **Garmin Coach / training-plan workouts cannot be edited.** They are
+  identified by UUID and generated by Garmin; these tools reject them and
+  suggest copying the workout into your own with `upload_workout`.
+- **Partial bodies are rejected by Garmin** (`400 There is an error with the
+  workout segments`), so every edit sends the complete workout. `update_workout`
+  handles that for you by reading the workout before writing it back.
+- **Derived estimates are never sent.** Garmin stores whatever
+  `estimatedDurationInSecs` it is given without checking it against the steps —
+  a PUT claiming 99999 seconds for a 2700-second workout is stored as 99999.
+  These tools drop the estimate fields so Garmin recomputes them.
+- **The calendar summary caches its own duration.** After an edit,
+  `get_scheduled_workouts` may keep reporting the `estimated_duration_seconds`
+  recorded when the workout was scheduled. The workout itself, and what the
+  watch receives, is correct.
 
 ### Raw `upload_workout` end conditions
 
