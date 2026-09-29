@@ -32,6 +32,8 @@
       "args": [
         "--python",
         "3.12",
+        "--python-preference",
+        "only-managed",
         "--from",
         "git+https://github.com/Taxuspt/garmin_mcp",
         "garmin-mcp"
